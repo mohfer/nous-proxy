@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+.env
+data/*.json
+.venv/
+.omc/
+
+# Python tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Local Claude/OMC metadata
+.claude/
+.agents/
+skills-lock.json
+
+# Logs
+*.log
