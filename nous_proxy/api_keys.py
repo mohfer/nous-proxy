@@ -12,7 +12,6 @@ import logging
 import secrets
 
 from fastapi import HTTPException, Request
-from fastapi.security import HTTPAuthorizationCredentials
 
 from nous_proxy.config import settings
 
@@ -60,6 +59,15 @@ def save_api_keys(keys: set[str]) -> None:
 def generate_api_key() -> str:
     """Generate a new API key with nous-proxy prefix."""
     return f"np-{secrets.token_urlsafe(32)}"
+
+
+def create_and_store_api_key() -> str:
+    """Generate a new API key, store it in memory, and persist it to disk."""
+    global _loaded_keys
+    key = generate_api_key()
+    _loaded_keys.add(key)
+    save_api_keys(_loaded_keys)
+    return key
 
 
 def verify_api_key(request: Request) -> str:

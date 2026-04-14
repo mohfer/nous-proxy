@@ -20,12 +20,11 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
+from dataclasses import dataclass
 
 import httpx
 
-from nous_proxy.auth import refresh_token, mint_agent_key, OAuthError
+from nous_proxy.auth import refresh_token, mint_agent_key, OAuthError, create_portal_client
 from nous_proxy.config import settings
 
 logger = logging.getLogger(__name__)
@@ -146,6 +145,9 @@ class TokenManager:
 
     async def ensure_valid_token(self, client: httpx.AsyncClient) -> None:
         """Ensure we have a valid access token, refreshing if needed."""
+        if self._state.is_token_valid:
+            return
+
         async with self._lock:
             if self._state.is_token_valid:
                 return
@@ -160,6 +162,9 @@ class TokenManager:
 
         Returns the agent key string.
         """
+        if self._state.is_agent_key_valid:
+            return self._state.agent_key
+
         async with self._lock:
             if self._state.is_agent_key_valid:
                 return self._state.agent_key
@@ -186,7 +191,7 @@ class TokenManager:
 
     async def _background_refresh_loop(self) -> None:
         """Periodically refresh tokens and agent keys."""
-        async with httpx.AsyncClient(timeout=30, headers={"Accept": "application/json"}) as client:
+        async with create_portal_client() as client:
             while True:
                 try:
                     # Refresh access token if expiring soon

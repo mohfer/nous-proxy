@@ -17,6 +17,11 @@ from nous_proxy.config import settings
 logger = logging.getLogger(__name__)
 
 
+def create_portal_client() -> httpx.AsyncClient:
+    """Create a configured HTTP client for Nous portal OAuth calls."""
+    return httpx.AsyncClient(timeout=30, headers={"Accept": "application/json"})
+
+
 class OAuthError(Exception):
     """OAuth flow error."""
 

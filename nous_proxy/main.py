@@ -6,7 +6,6 @@ Exposes NousResearch inference API as standard REST API with static API key auth
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sys
 import time
@@ -18,10 +17,15 @@ from fastapi import FastAPI, Depends, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 
 from nous_proxy.config import settings
-from nous_proxy.api_keys import load_api_keys, verify_api_key, generate_api_key, save_api_keys
+from nous_proxy.api_keys import load_api_keys, verify_api_key, create_and_store_api_key
 from nous_proxy.token_manager import token_manager
-from nous_proxy.auth import request_device_code, poll_for_token, OAuthError
-from nous_proxy.proxy import proxy_chat_completions, proxy_models
+from nous_proxy.auth import request_device_code, poll_for_token, OAuthError, create_portal_client
+from nous_proxy.proxy import (
+    proxy_chat_completions,
+    proxy_models,
+    init_proxy_client,
+    close_proxy_client,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -47,6 +51,7 @@ async def lifespan(app: FastAPI):
     # Startup
     load_api_keys()
     token_manager.load()
+    init_proxy_client()
     refresh_task = token_manager.start_background_refresh()
     logger.info("NousResearch Proxy starting on %s:%d", settings.proxy_host, settings.proxy_port)
 
@@ -61,6 +66,8 @@ async def lifespan(app: FastAPI):
         await refresh_task
     except asyncio.CancelledError:
         pass
+
+    await close_proxy_client()
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +110,7 @@ async def start_device_auth(api_key: str = Depends(verify_api_key)):
     """
     global _device_code_state
 
-    async with httpx.AsyncClient(timeout=30, headers={"Accept": "application/json"}) as client:
+    async with create_portal_client() as client:
         try:
             data = await request_device_code(client)
         except httpx.HTTPStatusError as e:
@@ -144,7 +151,7 @@ async def poll_auth(api_key: str = Depends(verify_api_key)):
             content={"error": "No pending device code. Call /auth/device-code first."},
         )
 
-    async with httpx.AsyncClient(timeout=30, headers={"Accept": "application/json"}) as client:
+    async with create_portal_client() as client:
         try:
             data = await poll_for_token(
                 client,
@@ -220,10 +227,7 @@ async def list_models_short(api_key: str = Depends(verify_api_key)):
 @app.post("/admin/generate-key")
 async def admin_generate_key(api_key: str = Depends(verify_api_key)):
     """Generate a new API key (requires existing valid key)."""
-    from nous_proxy.api_keys import _loaded_keys
-    new_key = generate_api_key()
-    _loaded_keys.add(new_key)
-    save_api_keys(_loaded_keys)
+    new_key = create_and_store_api_key()
     return {"api_key": new_key}
 
 
