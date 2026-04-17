@@ -41,6 +41,36 @@ logger = logging.getLogger("nous_proxy")
 # In-memory device code state (for current auth flow)
 # ---------------------------------------------------------------------------
 _device_code_state: dict = {}
+_auto_poll_task: asyncio.Task | None = None
+
+
+async def _auto_poll_until_authorized(device_code: str, interval: int) -> None:
+    """Background task: poll NousPortal until user authorizes, then update tokens."""
+    global _device_code_state, _auto_poll_task
+    async with create_portal_client() as client:
+        try:
+            data = await poll_for_token(
+                client,
+                device_code=device_code,
+                interval=interval,
+                timeout=600,  # 10 minutes max
+            )
+            token_manager.update_from_token_response(data)
+            _device_code_state["status"] = "authenticated"
+            _device_code_state["authenticated_at"] = time.time()
+            logger.info("Auto-poll: authentication successful!")
+        except OAuthError as e:
+            _device_code_state["status"] = "error"
+            _device_code_state["error"] = e.error
+            _device_code_state["error_description"] = e.description
+            logger.error("Auto-poll failed: %s", e)
+        except Exception as e:
+            _device_code_state["status"] = "error"
+            _device_code_state["error"] = "unexpected"
+            _device_code_state["error_description"] = str(e)
+            logger.exception("Auto-poll unexpected error")
+        finally:
+            _auto_poll_task = None
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +91,13 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    # Cancel auto-poll task if still running
+    if _auto_poll_task and not _auto_poll_task.done():
+        _auto_poll_task.cancel()
+        try:
+            await _auto_poll_task
+        except asyncio.CancelledError:
+            pass
     refresh_task.cancel()
     try:
         await refresh_task
@@ -103,12 +140,20 @@ async def health():
 # ---------------------------------------------------------------------------
 @app.post("/auth/device-code")
 async def start_device_auth(api_key: str = Depends(verify_api_key)):
-    """Start OAuth device code flow. Returns URL + code for user to authorize.
+    """Start OAuth device code flow. Returns URL for user to authorize.
 
-    After calling this, user opens verification_uri and enters user_code,
-    then call POST /auth/poll to complete the flow.
+    Automatically starts background polling — no need to call /auth/poll.
+    Check /auth/status to see if auth completed.
     """
-    global _device_code_state
+    global _device_code_state, _auto_poll_task
+
+    # Cancel any existing poll task
+    if _auto_poll_task and not _auto_poll_task.done():
+        _auto_poll_task.cancel()
+        try:
+            await _auto_poll_task
+        except asyncio.CancelledError:
+            pass
 
     async with create_portal_client() as client:
         try:
@@ -124,26 +169,68 @@ async def start_device_auth(api_key: str = Depends(verify_api_key)):
                 content={"error": f"Connection error: {e}"},
             )
 
-    # Store device_code for polling
+    device_code = data["device_code"]
+    interval = data.get("interval", 5)
+
+    # Store state
     _device_code_state = {
-        "device_code": data["device_code"],
-        "interval": data.get("interval", 5),
+        "device_code": device_code,
+        "interval": interval,
+        "status": "polling",
         "obtained_at": time.time(),
     }
 
+    # Start auto-poll in background
+    _auto_poll_task = asyncio.create_task(
+        _auto_poll_until_authorized(device_code, interval)
+    )
+
+    verification_url = data.get("verification_uri_complete", data.get("verification_uri"))
+
     return {
+        "status": "polling",
         "user_code": data["user_code"],
-        "verification_uri": data.get("verification_uri_complete", data.get("verification_uri")),
+        "verification_uri": verification_url,
         "expires_in": data.get("expires_in", 600),
-        "message": f"Open the URL and enter code: {data['user_code']}",
+        "message": f"Open the URL and enter code: {data['user_code']}. Polling in background...",
     }
+
+
+@app.get("/auth/status")
+async def auth_status(api_key: str = Depends(verify_api_key)):
+    """Check current authentication / device-code flow status."""
+    state = _device_code_state
+    if not state:
+        s = token_manager.state
+        return {
+            "authenticated": bool(s.access_token and s.is_token_valid),
+            "agent_key_valid": s.is_agent_key_valid,
+            "flow_active": False,
+        }
+
+    status = state.get("status", "unknown")
+    resp = {
+        "flow_active": True,
+        "status": status,
+    }
+
+    if status == "polling":
+        resp["message"] = "Waiting for user to authorize in browser..."
+    elif status == "authenticated":
+        resp["message"] = "Successfully authenticated!"
+    elif status == "error":
+        resp["error"] = state.get("error", "")
+        resp["error_description"] = state.get("error_description", "")
+
+    return resp
 
 
 @app.post("/auth/poll")
 async def poll_auth(api_key: str = Depends(verify_api_key)):
-    """Poll for token after user has authorized via device code.
+    """Poll for token — fallback if auto-poll is still running.
 
-    Call this after POST /auth/device-code and user authorization.
+    In most cases you don't need this. Just hit GET /auth/status instead.
+    This will wait up to 60s for the auto-poll to complete.
     """
     if not _device_code_state.get("device_code"):
         return JSONResponse(
@@ -151,38 +238,40 @@ async def poll_auth(api_key: str = Depends(verify_api_key)):
             content={"error": "No pending device code. Call /auth/device-code first."},
         )
 
-    async with create_portal_client() as client:
+    # If auto-poll already finished, return its result
+    status = _device_code_state.get("status")
+    if status == "authenticated":
+        return {"status": "authenticated", "message": "Already authenticated!"}
+    if status == "error":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": _device_code_state.get("error", "unknown"),
+                "description": _device_code_state.get("error_description", ""),
+            },
+        )
+
+    # Still polling — wait for the background task to finish
+    if _auto_poll_task:
         try:
-            data = await poll_for_token(
-                client,
-                device_code=_device_code_state["device_code"],
-                interval=_device_code_state["interval"],
-                timeout=60,  # Short timeout for single poll attempt
-            )
-            token_manager.update_from_token_response(data)
-            _device_code_state.clear()
-
-            return {
-                "status": "authenticated",
-                "expires_in": data.get("expires_in", 3600),
-                "message": "Successfully authenticated!",
-            }
-
-        except OAuthError as e:
-            if e.error == "timeout":
-                return JSONResponse(
-                    status_code=408,
-                    content={"error": "User has not authorized yet. Try again."},
-                )
+            await asyncio.wait_for(_auto_poll_task, timeout=60)
+        except asyncio.TimeoutError:
             return JSONResponse(
-                status_code=400,
-                content={"error": e.error, "description": e.description},
+                status_code=408,
+                content={"error": "Still waiting for user to authorize. Try again or check /auth/status."},
             )
-        except httpx.HTTPError as e:
-            return JSONResponse(
-                status_code=502,
-                content={"error": f"Connection error: {e}"},
-            )
+
+    # Re-check after waiting
+    status = _device_code_state.get("status")
+    if status == "authenticated":
+        return {"status": "authenticated", "message": "Successfully authenticated!"}
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": _device_code_state.get("error", "unknown"),
+            "description": _device_code_state.get("error_description", ""),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +338,11 @@ async def root():
             <li><code>GET  /v1/models</code></li>
             <li><code>GET  /health</code></li>
         </ul>
-        <h2>Auth</h2>
+        <h2>Auth (auto-poll)</h2>
         <ol>
-            <li><code>POST /auth/device-code</code> — start OAuth flow</li>
+            <li><code>POST /auth/device-code</code> — start OAuth + auto-poll</li>
             <li>Open URL + enter code in browser</li>
-            <li><code>POST /auth/poll</code> — complete auth</li>
+            <li><code>GET /auth/status</code> — check if auth completed</li>
         </ol>
     </body>
     </html>
