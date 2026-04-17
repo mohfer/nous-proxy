@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 
 from nous_proxy.config import settings
@@ -26,6 +27,7 @@ from nous_proxy.proxy import (
     init_proxy_client,
     close_proxy_client,
 )
+from nous_proxy.anthropic import proxy_anthropic_messages
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -112,9 +114,18 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="NousResearch Proxy",
-    description="OAuth proxy for NousResearch inference API (OpenAI-compatible)",
-    version="0.1.0",
+    description="OAuth proxy for NousResearch inference API (OpenAI-compatible + Anthropic-compatible)",
+    version="0.2.0",
     lifespan=lifespan,
+)
+
+# CORS - allow agentic coding tools (OpenCode, Claude Code, browser-based tools)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -296,6 +307,32 @@ async def list_models(api_key: str = Depends(verify_api_key)):
     return await proxy_models()
 
 
+# ---------------------------------------------------------------------------
+# Anthropic-Compatible Endpoints (for Claude Code)
+# ---------------------------------------------------------------------------
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request, api_key: str = Depends(verify_api_key)):
+    """Anthropic Messages API endpoint for Claude Code compatibility.
+
+    Translates Anthropic Messages API format to OpenAI chat completions
+    and back, allowing Claude Code to use this proxy transparently.
+
+    Usage:
+        export ANTHROPIC_BASE_URL=http://localhost:8090
+        export ANTHROPIC_API_KEY=np-xxxxx
+        claude
+    """
+    return await proxy_anthropic_messages(request)
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(request: Request, api_key: str = Depends(verify_api_key)):
+    """Stub for Anthropic count_tokens endpoint (Claude Code may call this)."""
+    return JSONResponse(content={
+        "input_tokens": 0,
+    })
+
+
 
 # ---------------------------------------------------------------------------
 # Convenience: non-versioned routes (same as /v1/*)
@@ -331,12 +368,16 @@ async def root():
     <head><title>NousResearch Proxy</title></head>
     <body style="font-family:system-ui;max-width:600px;margin:40px auto;padding:0 20px">
         <h1>NousResearch Proxy</h1>
-        <p>OpenAI-compatible API proxy backed by NousResearch OAuth.</p>
-        <h2>Endpoints</h2>
+        <p>OpenAI + Anthropic compatible API proxy backed by NousResearch OAuth.</p>
+        <h2>OpenAI Endpoints</h2>
         <ul>
             <li><code>POST /v1/chat/completions</code></li>
             <li><code>GET  /v1/models</code></li>
             <li><code>GET  /health</code></li>
+        </ul>
+        <h2>Anthropic Endpoints (Claude Code)</h2>
+        <ul>
+            <li><code>POST /v1/messages</code></li>
         </ul>
         <h2>Auth (auto-poll)</h2>
         <ol>

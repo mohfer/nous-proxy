@@ -71,16 +71,29 @@ def create_and_store_api_key() -> str:
 
 
 def verify_api_key(request: Request) -> str:
-    """FastAPI dependency: extract and validate API key from Authorization header."""
-    auth_header = request.headers.get("Authorization", "")
+    """FastAPI dependency: extract and validate API key from Authorization header.
 
-    if not auth_header.startswith("Bearer "):
+    Supports:
+      - Authorization: Bearer <key>  (OpenAI standard)
+      - x-api-key: <key>             (Anthropic SDK / Claude Code)
+    """
+    key = ""
+
+    # Try Authorization: Bearer first
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        key = auth_header[7:].strip()
+
+    # Fall back to x-api-key (Anthropic SDK)
+    if not key:
+        key = request.headers.get("x-api-key", "").strip()
+
+    if not key:
         raise HTTPException(
             status_code=401,
-            detail="Missing or invalid Authorization header. Use: Bearer <api_key>",
+            detail="Missing API key. Use Authorization: Bearer <key> or x-api-key: <key>",
         )
 
-    key = auth_header[7:].strip()
     if key not in _loaded_keys:
         raise HTTPException(status_code=401, detail="Invalid API key")
 

@@ -1,6 +1,6 @@
 # NousProxy
 
-OpenAI-compatible REST API proxy backed by NousResearch Portal OAuth — run your own inference gateway with subscription-based rate limits.
+OpenAI + Anthropic compatible REST API proxy backed by NousResearch Portal OAuth — run your own inference gateway with subscription-based rate limits. Works with agentic coding tools like **OpenCode**, **Claude Code**, and **OpenAI Codex CLI**.
 
 ## How It Works
 
@@ -56,7 +56,55 @@ curl http://localhost:8090/v1/chat/completions \
 | POST | `/auth/poll` | Fallback: wait for auth completion |
 | POST | `/v1/chat/completions` | OpenAI-compatible chat completions |
 | GET | `/v1/models` | List available models |
+| POST | `/v1/messages` | Anthropic Messages API (Claude Code) |
+| POST | `/v1/messages/count_tokens` | Anthropic token counting stub |
 | POST | `/admin/generate-key` | Generate a new proxy API key |
+
+## Agentic Coding Tools
+
+### 1. OpenCode
+
+OpenCode uses AI SDK with OpenAI-compatible API. Configure in `~/.opencode.json`:
+
+```json
+{
+  "provider": {
+    "nous": {
+      "options": {
+        "baseURL": "http://localhost:8090/v1",
+        "apiKey": "np-YOUR_PROXY_KEY"
+      }
+    }
+  }
+}
+```
+
+Then run `/models` in OpenCode to select a model (e.g. `xiaomi/mimo-v2-pro`).
+
+### 2. Claude Code
+
+Claude Code uses Anthropic Messages API. Set environment variables:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8090
+export ANTHROPIC_API_KEY=np-YOUR_PROXY_KEY
+claude
+```
+
+The proxy translates Anthropic Messages API format to OpenAI chat completions
+automatically, including tool use and streaming.
+
+### 3. OpenAI Codex CLI
+
+Codex CLI uses standard OpenAI API. Set environment variables:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:8090/v1
+export OPENAI_API_KEY=np-YOUR_PROXY_KEY
+codex
+```
+
+Or sign in with ChatGPT (no proxy needed for that path).
 
 ## Models — Free Plan
 
@@ -121,6 +169,7 @@ PROXY_API_KEYS=np-xxx   # Comma-separated, or auto-generated
 │   ├── token_manager.py   # Token lifecycle + auto-refresh
 │   ├── api_keys.py        # API key validation
 │   ├── proxy.py           # Request forwarding + attribution
+│   ├── anthropic.py       # Anthropic Messages API translator (Claude Code)
 │   └── main.py            # FastAPI app + CLI
 └── scripts/
     ├── install.sh         # Setup script
