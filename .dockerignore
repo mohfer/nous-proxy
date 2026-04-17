@@ -1,0 +1,38 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+.ruff_cache
+.mypy_cache
+.pytest_cache
+
+# Build artifacts
+build
+dist
+
+# Local data (mounted as volume)
+data/*.json
+
+# Environment (use docker-compose env_file or override)
+.env
+
+# IDE
+.vscode
+.idea
+
+# Claude / agents
+.claude
+.agents
+skills-lock.json
+
+# Docs / misc
+CLAUDE.md
+README.md
+scripts/
+*.log

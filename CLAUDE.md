@@ -36,11 +36,10 @@ Note: this repository currently does not include a first-party `tests/` director
 uv build
 ```
 
-### Linux service/deployment commands (from repo scripts)
+### Linux service/deployment (from repo scripts)
 ```bash
-bash scripts/install.sh
-systemctl start nous-proxy
-systemctl status nous-proxy
+# Docker (recommended)
+docker compose up -d
 ```
 
 ## Architecture overview
@@ -67,6 +66,7 @@ High-level request path:
 - `data/api_keys.json`: persisted inbound proxy API keys.
 
 ### Operational assumptions from scripts/docs
-- Systemd unit expects deployment at `/opt/nous-proxy` and loads `/opt/nous-proxy/.env`.
-- Service entrypoint is `/opt/nous-proxy/.venv/bin/nous-proxy`.
+- Docker is the primary deployment method (docker-compose.yml, Dockerfile).
+- Data directory (`data/`) is bind-mounted to host `./data/`.
+- Entrypoint auto-chowns `data/` to `app` user (UID 999) on startup.
 - First-time OAuth is a two-step flow: `POST /auth/device-code` then `POST /auth/poll` after browser authorization.

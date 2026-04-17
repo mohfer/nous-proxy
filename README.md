@@ -13,16 +13,16 @@ App Client --[API Key]--> NousProxy --[OAuth Agent Key]--> NousResearch Inferenc
 3. Clients use a static proxy API key for authentication.
 4. Forwards requests to NousResearch inference API with product attribution (`tags: ["product=hermes-agent"]`).
 
-## Quick Start
+## Quick Start (Docker — Recommended)
 
 ```bash
-# Install
 cd /opt/nous-proxy
-bash scripts/install.sh
-systemctl start nous-proxy
+
+# Build & start
+docker compose up -d
 
 # Get your proxy API key
-cat /opt/nous-proxy/data/api_keys.json
+cat data/api_keys.json
 
 # Auth (one-time, auto-polls until you authorize)
 curl -X POST http://localhost:8090/auth/device-code \
@@ -43,7 +43,18 @@ curl http://localhost:8090/v1/chat/completions \
     "model": "xiaomi/mimo-v2-pro",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
+
+# Logs
+docker logs -f nous-proxy
+
+# Stop
+docker compose down
+
+# Rebuild after code changes
+docker compose up -d --build
 ```
+
+Data (tokens, API keys) persists in `./data/` via bind mount.
 
 ## Endpoints
 
@@ -157,23 +168,24 @@ PROXY_API_KEYS=np-xxx   # Comma-separated, or auto-generated
 ```
 /opt/nous-proxy/
 ├── pyproject.toml         # Dependencies & build config
+├── Dockerfile             # Multi-stage Docker build
+├── docker-compose.yml     # Container orchestration
+├── docker-entrypoint.sh   # Auto-fix data dir ownership
+├── .dockerignore          # Docker build exclusions
 ├── .env                   # Environment config
 ├── .env.example           # Template
-├── data/                  # Persisted tokens & API keys
+├── data/                  # Persisted tokens & API keys (bind mount)
 │   ├── tokens.json
 │   └── api_keys.json
-├── nous_proxy/
-│   ├── __init__.py
-│   ├── config.py          # Settings (pydantic-settings)
-│   ├── auth.py            # OAuth device code flow
-│   ├── token_manager.py   # Token lifecycle + auto-refresh
-│   ├── api_keys.py        # API key validation
-│   ├── proxy.py           # Request forwarding + attribution
-│   ├── anthropic.py       # Anthropic Messages API translator (Claude Code)
-│   └── main.py            # FastAPI app + CLI
-└── scripts/
-    ├── install.sh         # Setup script
-    └── nous-proxy.service # Systemd unit
+└── nous_proxy/
+    ├── __init__.py
+    ├── config.py          # Settings (pydantic-settings)
+    ├── auth.py            # OAuth device code flow
+    ├── token_manager.py   # Token lifecycle + auto-refresh
+    ├── api_keys.py        # API key validation
+    ├── proxy.py           # Request forwarding + attribution
+    ├── anthropic.py       # Anthropic Messages API translator (Claude Code)
+    └── main.py            # FastAPI app + CLI
 ```
 
 ## Development
