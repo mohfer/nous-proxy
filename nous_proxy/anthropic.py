@@ -469,27 +469,24 @@ async def _anthropic_stream_generator(
 
             # Handle thinking/reasoning
             reasoning_text = delta.get("reasoning") or delta.get("reasoning_text") or ""
-            if reasoning_text and not state.content_block_open:
-                # Open thinking block
-                yield _sse_event("content_block_start", {
-                    "type": "content_block_start",
-                    "index": state.content_block_index,
-                    "content_block": {"type": "thinking", "thinking": ""},
-                })
-                state.thinking_block_open = True
-                yield _sse_event("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": state.content_block_index,
-                    "delta": {"type": "thinking_delta", "thinking": reasoning_text},
-                })
-            elif reasoning_text and state.thinking_block_open:
-                yield _sse_event("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": state.content_block_index,
-                    "delta": {"type": "thinking_delta", "thinking": reasoning_text},
-                })
+            if reasoning_text:
+                if not state.thinking_block_open and not state.content_block_open:
+                    # Open thinking block (first reasoning chunk)
+                    yield _sse_event("content_block_start", {
+                        "type": "content_block_start",
+                        "index": state.content_block_index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    })
+                    state.thinking_block_open = True
+                if state.thinking_block_open:
+                    # Accumulate reasoning into thinking block
+                    yield _sse_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": state.content_block_index,
+                        "delta": {"type": "thinking_delta", "thinking": reasoning_text},
+                    })
 
-            # Handle reasoning_opaque (signature)
+            # Handle reasoning_opaque (signature) — only emit when non-empty
             reasoning_opaque = delta.get("reasoning_opaque") or ""
             if reasoning_opaque and state.thinking_block_open:
                 yield _sse_event("content_block_delta", {
@@ -500,9 +497,7 @@ async def _anthropic_stream_generator(
 
             # Handle text content
             text_delta = delta.get("content") or ""
-            # Some reasoning models put output in reasoning field when content is null
-            if not text_delta and reasoning_text:
-                text_delta = reasoning_text
+            # Do NOT fallback to reasoning_text — reasoning stays in thinking block
 
             if text_delta:
                 # Close thinking block if open
@@ -622,6 +617,7 @@ def _sse_event(event_type: str, data: dict) -> bytes:
 
 async def proxy_anthropic_messages(request: Request) -> StreamingResponse | JSONResponse:
     """Handle Anthropic Messages API requests."""
+    t0 = time.monotonic()
     body = await request.body()
     anthropic_req = json.loads(body) if body else {}
     stream = anthropic_req.get("stream", False)
@@ -636,12 +632,22 @@ async def proxy_anthropic_messages(request: Request) -> StreamingResponse | JSON
     # Inject hermes-agent attribution
     openai_req = _inject_hermes_attribution(openai_req)
 
-    # Get agent key
+    # EAGERLY get agent key BEFORE creating stream handler.
+    # This ensures token refresh happens here (blocking) rather than
+    # after the StreamingResponse is created, which would delay the
+    # upstream HTTP request by several seconds.
     client = _get_proxy_client()
+    t_key = time.monotonic()
     agent_key = await token_manager.ensure_valid_agent_key(client)
+    key_ms = (time.monotonic() - t_key) * 1000
     inference_url = token_manager.state.effective_inference_url
 
     openai_body = json.dumps(openai_req).encode()
+    prep_ms = (time.monotonic() - t0) * 1000
+
+    if key_ms > 100:
+        logger.info("Anthropic handler: agent_key took %.0fms (total prep %.0fms, %d bytes body)",
+                     key_ms, prep_ms, len(openai_body))
 
     if stream:
         return StreamingResponse(
@@ -687,6 +693,7 @@ async def proxy_anthropic_messages(request: Request) -> StreamingResponse | JSON
 
 async def _stream_handler(client, inference_url, agent_key, openai_body, meta):
     """Async generator for streaming responses."""
+    t0 = time.monotonic()
     try:
         async with client.stream(
             "POST",
@@ -698,6 +705,7 @@ async def _stream_handler(client, inference_url, agent_key, openai_body, meta):
                 "Content-Type": "application/json",
             },
         ) as resp:
+            connect_ms = (time.monotonic() - t0) * 1000
             if resp.status_code != 200:
                 error_body = await resp.aread()
                 try:
@@ -713,9 +721,16 @@ async def _stream_handler(client, inference_url, agent_key, openai_body, meta):
 
             # Estimate input tokens
             meta["input_tokens"] = len(openai_body) // 4
+            logger.info("Stream handler: upstream connect %.0fms, body %d bytes", connect_ms, len(openai_body))
 
+            first_chunk = True
             async def chunk_iter():
+                nonlocal first_chunk
                 async for chunk in resp.aiter_bytes():
+                    if first_chunk:
+                        ttft = (time.monotonic() - t0) * 1000
+                        logger.info("Stream handler: first chunk at %.0fms", ttft)
+                        first_chunk = False
                     yield chunk
 
             async for event_bytes in _anthropic_stream_generator(chunk_iter(), meta):

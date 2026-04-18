@@ -360,6 +360,12 @@ async def admin_generate_key(api_key: str = Depends(verify_api_key)):
 # ---------------------------------------------------------------------------
 # Root
 # ---------------------------------------------------------------------------
+@app.head("/")
+async def root_head():
+    """HEAD probe support for Claude Code and other clients."""
+    return JSONResponse(content=None, status_code=200)
+
+
 @app.get("/")
 async def root():
     """Simple landing page."""

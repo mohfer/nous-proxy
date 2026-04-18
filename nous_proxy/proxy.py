@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 import httpx
 from fastapi import Request
@@ -94,6 +95,7 @@ async def proxy_chat_completions(request: Request) -> StreamingResponse | JSONRe
 
     Handles both streaming (SSE) and non-streaming responses.
     """
+    t0 = time.monotonic()
     body = await request.body()
     req_data = json.loads(body) if body else {}
     is_stream = req_data.get("stream", False)
@@ -103,8 +105,13 @@ async def proxy_chat_completions(request: Request) -> StreamingResponse | JSONRe
     body = json.dumps(req_data).encode()
 
     client = _get_proxy_client()
+    t_key = time.monotonic()
     agent_key = await token_manager.ensure_valid_agent_key(client)
+    key_ms = (time.monotonic() - t_key) * 1000
     inference_url = token_manager.state.effective_inference_url
+
+    if key_ms > 100:
+        logger.info("OpenAI handler: agent_key took %.0fms", key_ms)
 
     if is_stream:
         async def generate():
@@ -131,6 +138,7 @@ async def proxy_chat_completions(request: Request) -> StreamingResponse | JSONRe
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
             },
         )
 

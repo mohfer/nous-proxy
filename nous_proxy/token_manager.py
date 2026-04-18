@@ -231,7 +231,7 @@ class TokenManager:
                 except Exception:
                     logger.exception("Unexpected error in background refresh")
 
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)
 
 
 # Singleton instance
