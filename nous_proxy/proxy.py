@@ -52,6 +52,7 @@ _REASONING_MODEL_PREFIXES = (
     "google/gemini-2",
     "qwen/qwen3",
     "x-ai/",
+    "xiaomi/mimo",  # MiMo-V2-Pro supports reasoning
 )
 
 

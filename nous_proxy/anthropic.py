@@ -17,7 +17,7 @@ from typing import Any, AsyncGenerator
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from nous_proxy.proxy import _get_proxy_client, _HERMES_UPSTREAM_HEADERS, _inject_hermes_attribution
+from nous_proxy.proxy import _get_proxy_client, _HERMES_UPSTREAM_HEADERS, _inject_hermes_attribution, _model_supports_reasoning
 from nous_proxy.token_manager import token_manager
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,29 @@ def preprocess_anthropic_payload(payload: dict) -> None:
     _strip_cache_control(payload)
     _sanitize_tools(payload)
     _merge_tool_result_text(payload)
+    _extract_thinking_param(payload)
+
+
+def _extract_thinking_param(payload: dict) -> None:
+    """Extract Anthropic 'thinking' param and store for later injection.
+
+    Claude Code may send {"thinking": {"type": "enabled", "budget_tokens": N}}
+    which needs to be mapped to OpenAI extra_body.reasoning on the outbound request.
+    We store it in payload["_thinking_config"] so _anthropic_to_openai can pick it up.
+
+    IMPORTANT: Not all models support reasoning. We store the config but
+    _anthropic_to_openai will only inject it for models that support it.
+    """
+    thinking = payload.pop("thinking", None)
+    if thinking and isinstance(thinking, dict):
+        if thinking.get("type") == "enabled":
+            budget = thinking.get("budget_tokens", 16000)
+            payload["_thinking_config"] = {
+                "enabled": True,
+                "budget_tokens": budget,
+                "effort": "high" if budget >= 16000 else "medium" if budget >= 8000 else "low",
+            }
+            logger.info("Extended thinking requested: budget_tokens=%d", budget)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +216,26 @@ def _anthropic_to_openai(body: dict) -> tuple[dict, dict]:
     if openai_tool_choice is not None:
         openai_req["tool_choice"] = openai_tool_choice
 
+    # --- Thinking config (from Anthropic 'thinking' param) ---
+    # Only inject reasoning for models that actually support it.
+    # Models like xiaomi/mimo-v2-pro don't support reasoning and will
+    # produce garbage output if reasoning is injected.
+    thinking_config = body.get("_thinking_config")
+    if thinking_config and _model_supports_reasoning(model):
+        extra = dict(openai_req.get("extra_body") or {})
+        extra["reasoning"] = thinking_config
+        openai_req["extra_body"] = extra
+        logger.info("Injecting reasoning for model %s (supports reasoning)", model)
+    elif thinking_config:
+        logger.info("Skipping reasoning for model %s (does not support reasoning)", model)
+
+    # --- Pass through Anthropic metadata ---
+    metadata = body.get("metadata")
+    if metadata:
+        extra = dict(openai_req.get("extra_body") or {})
+        extra["anthropic_metadata"] = metadata
+        openai_req["extra_body"] = extra
+
     return openai_req, meta
 
 
@@ -225,6 +268,18 @@ def _translate_content_blocks(content: list, role: str, messages: list[dict]) ->
                     "type": "image_url",
                     "image_url": {"url": source.get("url", "")},
                 })
+
+        elif btype == "document":
+            # Document blocks — extract text content if available
+            doc_content = block.get("content", "")
+            if isinstance(doc_content, str) and doc_content:
+                openai_content.append({"type": "text", "text": doc_content})
+            elif isinstance(doc_content, list):
+                for part in doc_content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text", "")
+                        if text:
+                            openai_content.append({"type": "text", "text": text})
 
         elif btype == "tool_use":
             tool_calls.append({
@@ -259,8 +314,28 @@ def _translate_content_blocks(content: list, role: str, messages: list[dict]) ->
             messages.append(tool_msg)
 
         elif btype == "thinking":
-            # Skip thinking blocks — not supported in OpenAI format
-            pass
+            # Preserve thinking blocks as prefixed text so the model can see
+            # its previous reasoning chain. Dropping them causes the model to
+            # lose context and re-reason from scratch (often hallucinating).
+            thinking_text = block.get("thinking", "")
+            signature = block.get("signature", "")
+            if thinking_text:
+                # Include signature marker if present (for verification continuity)
+                sig_marker = f" [sig:{signature[:16]}...]" if signature else ""
+                openai_content.append({
+                    "type": "text",
+                    "text": f"[previous thinking{sig_marker}]\n{thinking_text}\n[/previous thinking]",
+                })
+                logger.debug("Preserved thinking block: %d chars, signature=%s",
+                            len(thinking_text), bool(signature))
+
+        elif btype == "redacted_thinking":
+            # Redacted thinking — preserve marker so model knows thinking occurred
+            # but content was omitted for privacy/compliance
+            openai_content.append({
+                "type": "text",
+                "text": "[previous thinking was redacted]",
+            })
 
     # Build assistant message with tool_calls if present
     if tool_calls:
@@ -313,9 +388,15 @@ def _openai_to_anthropic(openai_resp: dict, meta: dict) -> dict:
     content: list[dict] = []
 
     # Text content — handle reasoning models that put output in "reasoning" field
+    # NousResearch API may return reasoning in: content, reasoning, reasoning_text, reasoning_content
     text = message.get("content") or ""
-    if not text and message.get("reasoning"):
-        text = message["reasoning"]
+    if not text:
+        text = (
+            message.get("reasoning")
+            or message.get("reasoning_text")
+            or message.get("reasoning_content")
+            or ""
+        )
     if text:
         content.append({"type": "text", "text": text})
 
@@ -467,8 +548,13 @@ async def _anthropic_stream_generator(
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
-            # Handle thinking/reasoning
-            reasoning_text = delta.get("reasoning") or delta.get("reasoning_text") or ""
+            # Handle thinking/reasoning — support multiple field names
+            reasoning_text = (
+                delta.get("reasoning")
+                or delta.get("reasoning_text")
+                or delta.get("reasoning_content")
+                or ""
+            )
             if reasoning_text:
                 if not state.thinking_block_open and not state.content_block_open:
                     # Open thinking block (first reasoning chunk)
@@ -480,6 +566,7 @@ async def _anthropic_stream_generator(
                     state.thinking_block_open = True
                 if state.thinking_block_open:
                     # Accumulate reasoning into thinking block
+                    output_tokens += 1  # rough estimate
                     yield _sse_event("content_block_delta", {
                         "type": "content_block_delta",
                         "index": state.content_block_index,
@@ -537,6 +624,7 @@ async def _anthropic_stream_generator(
                     "index": state.content_block_index,
                     "delta": {"type": "text_delta", "text": text_delta},
                 })
+                output_tokens += 1  # rough estimate
 
             # Handle tool calls
             for tc in delta.get("tool_calls", []):
@@ -572,6 +660,7 @@ async def _anthropic_stream_generator(
                     ai_index = tc.get("index", 0)
                     tc_info = state.tool_calls.get(ai_index)
                     if tc_info:
+                        output_tokens += 1  # rough estimate
                         yield _sse_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": tc_info["anthropic_index"],
@@ -586,6 +675,8 @@ async def _anthropic_stream_generator(
                     yield _sse_event(evt["type"], evt)
 
                 stop_reason = _map_stop_reason(finish) or "end_turn"
+                if stop_reason == "max_tokens":
+                    logger.warning("Response truncated: max_tokens reached (output_tokens=%d)", output_tokens)
                 yield _sse_event("message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
@@ -678,6 +769,7 @@ async def proxy_anthropic_messages(request: Request) -> StreamingResponse | JSON
         except Exception:
             error_data = {"error": {"message": resp.text}}
         error_msg = error_data.get("error", {}).get("message", str(error_data))
+
         return JSONResponse(
             status_code=resp.status_code,
             content={
@@ -713,6 +805,7 @@ async def _stream_handler(client, inference_url, agent_key, openai_body, meta):
                 except json.JSONDecodeError:
                     error_data = {"error": {"message": error_body.decode()}}
                 err_msg = error_data.get("error", {}).get("message", str(error_data))
+
                 yield _sse_event("error", {
                     "type": "error",
                     "error": {"type": "api_error", "message": err_msg},
